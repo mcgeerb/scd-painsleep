@@ -1,0 +1,165 @@
+%****************************************
+function [tvec,P,D] = pain_sim_core(tvec,patient_info,drug_info,dose_times1,dose_times2,dose_times3,bad_sleep_times,sleep_report_real,sleepqual_tol)
+% This core function runs the continuous-time part of the simulation of pain versus time.
+% Inputs:
+%   tvec: time points at which to evaluate variables
+%   patient_info: vector containing all patient information
+%   drug_info: matrix containing all drug information
+%   dose_times: vectors of all three drug dose times
+% Outputs:
+%   tvec: time vector at which variables have been evaluated
+%   P: Estimated current level of pain
+%   D: Estimated drug level in body
+
+% patient information
+P0 = patient_info(1);  % initial pain level
+u = patient_info(2);   % unmitigated pain level
+eps = patient_info(3); % noise in unmitigated pain level
+k0 = patient_info(4);  % relaxation rate
+k = patient_info(5:end-1);
+beta = patient_info(end);
+%   k1 = patient_info(5);  % marginal affect of drug1
+%   k2 = patient_info(6);  % marginal affect of drug2
+%   k3 = patient_info(7);  % marginal affect of drug3
+
+kD = drug_info(:,1); 
+a = drug_info(:,2); % drugs_to_include
+%   % extreme (long-acting) drug information
+%   kD1 = drug_info(1,1);
+%   a1 = drug_info(1,2);
+%   % severe (fast-acting) drug information
+%   kD2 = drug_info(2,1);
+%   a2 = drug_info(2,2);
+%   % mild (non-opiod) drug information
+%   kD3 = drug_info(3,1);
+%   a3 = drug_info(3,2);
+
+% Define the function to numerically integrate, incorporating parameters
+% (assuming eps = 0)
+func_handle = @(t,Y)(ODEmodel_Accum(t,Y,k0,u,k,kD,a,dose_times1,dose_times2,dose_times3,bad_sleep_times,sleep_report_real,beta,sleepqual_tol));
+% Set IC: Set initial pain and drug levels
+Y0 = [P0;zeros(length(kD),1)];
+% Set accuracy of numerical integration as well as max step size (note
+% that max step is important to capture delta function events)
+options = odeset('RelTol',1e-4, 'AbsTol',1e-4, 'MaxStep', 0.5,'NonNegative',1);
+% Do numerical integration
+[tvec, Y] = ode45(func_handle, tvec, Y0, options);
+% Pain and drug levels over time
+P = Y(:,1); D = Y(:,2:end);
+end
+%****************************************
+
+% Right hand side of function to integrate
+%****************************************
+
+
+
+function dY = ODEmodel_Accum(t,Y,k0,u,k,kD,a,dose_times1,dose_times2,dose_times3,bad_sleep_times,sleep_report_real,beta,sleepqual_tol)
+
+temp_sleep_times=bad_sleep_times(1,:);
+if ~isempty(bad_sleep_times) && size(bad_sleep_times,1) == 2 
+    num_accum = bad_sleep_times(2,1);
+else
+    num_accum = 0;
+end
+
+if (size(sleep_report_real,1) == 3)
+    sleep_avg = mean(sleep_report_real(3,:));
+else
+    sleep_avg = mean(sleep_report_real(2,:));
+end
+
+% 'ODEmodel' This function implements the differential equations
+%    k0, rate of decrease of pain without drugs or disease
+%    unmitigated pain, equilibrium for patient in absence of drugs
+dY = 0.0.*Y;
+% Note that rate constants could vary from patient to patient
+k_tot = k0 + dot(k,Y(2:end)); %size of Y is determined by kD / drug_info
+% find index associated with t
+
+
+if isempty(temp_sleep_times) || t < temp_sleep_times(1)
+    RHS_sleep=0;
+            pain_incr = 0;
+else
+    t_close_to_badsleeps = ((t-temp_sleep_times)<sleepqual_tol)&((t-temp_sleep_times)>=0);
+    if any(t_close_to_badsleeps)
+        index_t=find(t_close_to_badsleeps,1); % remove abs(),make this one directional
+        index2_t = find(sleep_report_real(1,:)==temp_sleep_times(index_t),1); % 3/21/23 WRONG INDEX WAS GOING INTO RHS SLEEP
+        if num_accum == 0
+            sq_over_cur_window = sleep_report_real(2,index2_t);
+        elseif num_accum == 1
+            if index2_t == 1
+                sq_over_cur_window = sleep_report_real(2,index2_t);
+            else
+                sq_over_cur_window = sleep_report_real(2,index2_t-1:index2_t);
+            end
+        else
+            if index2_t == 1
+                sq_over_cur_window = sleep_report_real(2,index2_t);
+            elseif (index2_t > 1) && (index2_t < num_accum)
+                sq_over_cur_window = sleep_report_real(2,index2_t-num_accum+2:index2_t);
+            else
+                sq_over_cur_window = sleep_report_real(2,index2_t-num_accum+1:index2_t);
+            end
+        end
+        % Deviation of Current Average from Patient-centered average
+        temp_dev = sleep_avg-sq_over_cur_window;
+        temp_dev(temp_dev<0)=[]; % get rid of the entries corresponding to a good night's sleep
+        dev_in_sleep = sum(temp_dev);
+     
+        OGNew2025 = beta*(dev_in_sleep); %*(1-abs(t-temp_sleep_times(index_t))/sleepqual_tol).*(t>=(temp_sleep_times(index_t)));
+
+        RHS_sleep = OGNew2025; 
+        %pain_incr = 0.01;
+    else
+        RHS_sleep=0;
+        pain_incr = 0;
+
+    end
+    
+end
+
+
+dY(1) = -k_tot*Y(1) + RHS_sleep; %max([0 RHS_sleep]);
+
+if length(kD)>0
+    dY(2:end) = -kD.*Y(2:end) + a.*dosefunc(t, dose_times1, dose_times2, dose_times3, length(Y)-1);
+end
+end % function ODEmodel
+%****************************************
+
+
+% Approximate a Dirac delta function as response to taking drug
+% (Note that this is instantaneous dose at time t)
+%****************************************
+function inc = dosefunc(t, dosetimes1, dosetimes2, dosetimes3, num_drugs)
+% We want this to look like a narrow tall rectangular function centered
+% at each  does time in the list.
+% 'inc' is the incremental increase in the drug concentration in the body
+% Here's a tunable small parameter.  It's going to have units of time.
+epsilon = 0.5;
+% Properties of each delta-function approximant:
+width = epsilon; % in hours
+height = 1/width; % so width*height = 1
+% compute delta function approximation
+% % Handle cases of 1 drug taken, 2 drugs taken, and 3 drugs taken
+switch num_drugs
+    case 0
+        inc = 0;
+    case 1
+        inc = height*sum(abs(t-dosetimes1-2.0*width)<(width/2));
+    case 2
+        inc(1,1) = height*sum(abs(t-dosetimes1-2.0*width)<(width/2));
+        inc(2,1) = height*sum(abs(t-dosetimes2-2.0*width)<(width/2));
+    case 3
+        inc(1,1) = height*sum(abs(t-dosetimes1-2.0*width)<(width/2));
+        inc(2,1) = height*sum(abs(t-dosetimes2-2.0*width)<(width/2));
+        inc(3,1) = height*sum(abs(t-dosetimes3-2.0*width)<(width/2));
+    otherwise
+        print 'error with drug count in dosefunc (pain_sim_interventions3)';
+end
+%inc = height*sum(abs(t-dosetimes-2.0*width)<(width/2)); % top hat
+%inc = sum(1.0/(width*sqrt(2*pi))*exp(-(t-dosetimes).^2/(2.0*width^2))); % gaussian
+end % function dosefunc
+%****************************************
